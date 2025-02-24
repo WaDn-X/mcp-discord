@@ -1,29 +1,199 @@
 import os
 import asyncio
 import logging
-from datetime import datetime
-from typing import Any, Dict, List, Optional
+import json
+import signal
+import sys
+import atexit
+import threading
+import ctypes
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Union
 from functools import wraps
+from dataclasses import dataclass, asdict
+from contextlib import asynccontextmanager
+from dotenv import load_dotenv
 
 import discord
 from discord.ext import commands
-from mcp.server import Server
-from mcp.types import Tool, TextContent, EmptyResult
+from discord.ext.commands import Bot
+from .template_manager import TemplateManager  # Korrigierter Import
+
+# Globale Template-Instanz
+templates = TemplateManager()
+
+# Lokale MCP-Klassen
+@dataclass
+class Tool:
+    name: str
+    description: str
+    inputSchema: Dict[str, Any]
+
+@dataclass
+class TextContent:
+    type: str = "text"
+    text: str = ""
+
+@dataclass
+class EmptyResult:
+    pass
+
+class Server:
+    def __init__(self, name: str):
+        self.name = name
+        self._tool_list_handler = None
+        self._tool_call_handler = None
+    
+    def list_tools(self):
+        def decorator(func):
+            self._tool_list_handler = func
+            return func
+        return decorator
+    
+    def call_tool(self):
+        def decorator(func):
+            self._tool_call_handler = func
+            return func
+        return decorator
+        
+    def create_initialization_options(self):
+        return {"name": self.name}
+        
+    async def run(self, read_stream: Any, write_stream: Any, options: dict):
+        logger.info(f"Starting MCP server: {self.name}")
+        while True:
+            try:
+                # Lese Daten - unterstützt beide Stream-Typen
+                try:
+                    if hasattr(read_stream, 'receive'):
+                        # MemoryObjectReceiveStream
+                        data = await read_stream.receive()
+                    else:
+                        # Standard StreamReader
+                        data = await read_stream.readline()
+                except anyio.EndOfStream:
+                    logger.info("Input stream closed, shutting down MCP server")
+                    break
+
+                if not data:
+                    logger.info("Input stream closed")
+                    # Weitere Verarbeitung folgt hier ...
+                    command = json.loads(data.decode('utf-8'))
+                    logger.debug(f"Received command: {command}")
+                    if command.get("type") == "list_tools" and self._tool_list_handler:
+                        tools = await self._tool_list_handler()
+                        response = {
+                            "type": "tools",
+                            "tools": [asdict(tool) for tool in tools]
+                        }
+                    elif command.get("type") == "call_tool" and self._tool_call_handler:
+                        tool_name = command.get("tool")
+                        args = command.get("arguments", {})
+                        result = await self._tool_call_handler(tool_name, args)
+                        response = {
+                            "type": "result",
+                            "result": [asdict(r) for r in result]
+                        }
+                    else:
+                        response = {
+                            "type": "error",
+                            "error": "Invalid command or handler not set"
+                        }
+                        
+                    # Sende Antwort - unterstützt beide Stream-Typen
+                    response_data = json.dumps(response).encode('utf-8') + b'\n'
+                    if hasattr(write_stream, 'send'):
+                        # MemoryObjectSendStream
+                        await write_stream.send(response_data)
+                    else:
+                        # Standard StreamWriter
+                        write_stream.write(response_data)
+                        await write_stream.drain()
+                else:
+                    # Verarbeite Daten
+                    command = json.loads(data.decode('utf-8'))
+                    logger.debug(f"Received command: {command}")
+                    if command.get("type") == "list_tools" and self._tool_list_handler:
+                        tools = await self._tool_list_handler()
+                        response = {
+                            "type": "tools",
+                            "tools": [asdict(tool) for tool in tools]
+                        }
+                    elif command.get("type") == "call_tool" and self._tool_call_handler:
+                        tool_name = command.get("tool")
+                        args = command.get("arguments", {})
+                        result = await self._tool_call_handler(tool_name, args)
+                        response = {
+                            "type": "result",
+                            "result": [asdict(r) for r in result]
+                        }
+                    else:
+                        response = {
+                            "type": "error",
+                            "error": "Invalid command or handler not set"
+                        }
+                        
+                    # Sende Antwort - unterstützt beide Stream-Typen
+                    response_data = json.dumps(response).encode('utf-8') + b'\n'
+                    if hasattr(write_stream, 'send'):
+                        # MemoryObjectSendStream
+                        await write_stream.send(response_data)
+                    else:
+                        # Standard StreamWriter
+                        write_stream.write(response_data)
+                        await write_stream.drain()
+                        
+            except json.JSONDecodeError as e:
+                logger.error(f"Invalid JSON received: {e}")
+                error_data = json.dumps({"type": "error", "error": str(e)}).encode('utf-8') + b'\n'
+                try:
+                    if hasattr(write_stream, 'send'):
+                        await write_stream.send(error_data)
+                    else:
+                        write_stream.write(error_data)
+                        await write_stream.drain()
+                except Exception as e2:
+                    logger.error("Failed to send error response", exc_info=True)
+            except Exception as e:
+                logger.error(f"Error processing command: {e}", exc_info=True)
+                error_data = json.dumps({"type": "error", "error": str(e)}).encode('utf-8') + b'\n'
+                try:
+                    if hasattr(write_stream, 'send'):
+                        await write_stream.send(error_data)
+                    else:
+                        write_stream.write(error_data)
+                        await write_stream.drain()
+                except Exception as e2:
+                    logger.error("Failed to send error response", exc_info=True)
+
+# Entferne die duplizierte stdio_server Funktion (sie ist bereits im mcp.server.stdio Modul)
 from mcp.server.stdio import stdio_server
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("discord-mcp-server")
 
+# Lade .env Datei
+load_dotenv()
+
+# Bot Configuration
+BOT_NAME = os.getenv("BOT_NAME", "WaDn ~ MCP")
+ORGA_NAME = os.getenv("ORGA_NAME", "WaDn-X.De")
+WEBSITE_URL = os.getenv("WEBSITE_URL", "https://wadn-x.de")
+DISCORD_INVITE = os.getenv("DISCORD_INVITE", "https://discord.gg/qSVqRDrRbX")
+
 # Discord bot setup
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 if not DISCORD_TOKEN:
+    print("Error: DISCORD_TOKEN not found in environment variables")
+    print("Please create a .env file with your Discord token. See .env.example for reference.")
     raise ValueError("DISCORD_TOKEN environment variable is required")
 
 # Initialize Discord bot with necessary intents
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+intents.dm_messages = True  # DM-Nachrichten aktivieren
+bot: Bot = commands.Bot(command_prefix="/", intents=intents, help_command=None)
 
 # Initialize MCP server
 app = Server("discord-server")
@@ -31,11 +201,128 @@ app = Server("discord-server")
 # Store Discord client reference
 discord_client = None
 
+# Füge Dictionary für Benutzer-Status hinzu
+welcomed_users = set()
+
+HELP_TEXT = """
+**Verfügbare Befehle:**
+- `/roles` - Zeigt deine Rollen in allen Servern
+- `/help` - Zeigt diese Hilfe
+- `/status` - Zeigt den Bot-Status
+"""
+
+WELCOME_TEXT = """
+👋 Willkommen! Ich bin der Discord-Bot von **WaDn-X.De**!
+
+Um loszulegen, tippe einfach `/help`
+- damit zeige ich dir alle verfügbaren Befehle.
+
+Falls du Fragen hast, besuche uns auf https://wadn-x.de
+oder Direckt im Discord unter https://discord.gg/qSVqRDrRbX
+
+Viel Spaß! 🚀
+"""
+
+# Befehle als Slash-Commands neu definieren
+@bot.tree.command(name="roles", description="Zeigt deine Rollen in allen Servern")
+async def roles(interaction: discord.Interaction):
+    """Zeigt die Rollen des Benutzers"""
+    if isinstance(interaction.channel, discord.DMChannel):
+        user_roles = []
+        for guild in bot.guilds:
+            member = guild.get_member(interaction.user.id)
+            if member:
+                roles = [role.name for role in member.roles if role.name != "@everyone"]
+                if roles:
+                    user_roles.append(f"Server {guild.name}: {', '.join(roles)}")
+        
+        response = "Deine Rollen:\n" + "\n".join(user_roles) if user_roles else "Du hast keine Rollen in gemeinsamen Servern."
+        await interaction.response.send_message(response, ephemeral=True)
+
+@bot.tree.command(name="status", description="Zeigt den Bot-Status")
+async def status(interaction: discord.Interaction):
+    """Zeigt den Status des Bots"""
+    if isinstance(interaction.channel, discord.DMChannel):
+        status = f"""
+Bot Status:
+- Name: {bot.user.name}
+- ID: {bot.user.id}
+- Server: {len(bot.guilds)}
+- Ping: {round(bot.latency * 1000)}ms
+- Uptime: {datetime.now() - bot.start_time}
+"""
+        await interaction.response.send_message(status, ephemeral=True)
+
+@bot.tree.command(name="help", description="Zeigt diese Hilfe")
+async def help(interaction: discord.Interaction):
+    """Zeigt die Hilfe"""
+    help_text = templates.get("help")
+    await interaction.response.send_message(help_text, ephemeral=True)
+
 @bot.event
 async def on_ready():
     global discord_client
     discord_client = bot
+    bot.start_time = datetime.now()
+    
+    # Synchronisiere Slash-Commands
+    await bot.tree.sync()
+    
     logger.info(f"Logged in as {bot.user.name}")
+
+@bot.event
+async def on_message(message):
+    """Handle incoming messages"""
+    if message.author == bot.user:
+        return
+
+    try:
+        # Handle DMs
+        if isinstance(message.channel, discord.DMChannel):
+            # Prüfe ob der Benutzer bereits begrüßt wurde
+            if message.author.id not in welcomed_users:
+                welcome_msg = templates.get("welcome",
+                    user=message.author.mention,
+                    bot_name=BOT_NAME,
+                    orga_name=ORGA_NAME,
+                    website=WEBSITE_URL,
+                    discord_invite=DISCORD_INVITE
+                )
+                await message.channel.send(welcome_msg)
+                welcomed_users.add(message.author.id)
+        
+        # Handle mentions in channels
+        else:
+            # Check for direct bot mention
+            if bot.user in message.mentions:
+                response = templates.get("bot_mention", user=message.author.mention)
+                await message.channel.send(response)
+                return
+
+            # Check for role mentions
+            mentioned_roles = set(role.id for role in message.role_mentions)
+            bot_roles = set(role.id for role in message.guild.get_member(bot.user.id).roles)
+            
+            if mentioned_roles & bot_roles:
+                # Finde die erste gemeinsame Rolle für die Erwähnung
+                role_id = (mentioned_roles & bot_roles).pop()
+                role = discord.utils.get(message.guild.roles, id=role_id)
+                response = templates.get("role_mention",
+                    user=message.author.mention,
+                    role=role.mention if role else "unbekannt"
+                )
+                await message.channel.send(response)
+                return
+            
+    except Exception as e:
+        error_msg = templates.get("error", error=str(e))
+        logger.error(f"Error handling message: {e}", exc_info=True)
+        await message.channel.send(error_msg)
+
+    await bot.process_commands(message)
+
+# Continue processing commands
+    await bot.process_commands(message)
 
 # Helper function to ensure Discord client is ready
 def require_discord_client(func):
@@ -49,7 +336,7 @@ def require_discord_client(func):
 @app.list_tools()
 async def list_tools() -> List[Tool]:
     """List available Discord tools."""
-    return [
+    tools = [
         # Server Information Tools
         Tool(
             name="get_server_info",
@@ -204,7 +491,7 @@ async def list_tools() -> List[Tool]:
         Tool(
             name="add_multiple_reactions",
             description="Add multiple reactions to a message",
-            inputSchema={
+            inputSchema={{
                 "type": "object",
                 "properties": {
                     "channel_id": {
@@ -225,7 +512,7 @@ async def list_tools() -> List[Tool]:
                     }
                 },
                 "required": ["channel_id", "message_id", "emojis"]
-            }
+            }}
         ),
         Tool(
             name="remove_reaction",
@@ -328,8 +615,25 @@ async def list_tools() -> List[Tool]:
                 },
                 "required": ["channel_id", "message_id", "reason"]
             }
-        )
+        ),
+        
+        # User Role Tools
+        Tool(
+            name="get_user_roles",
+            description="Get all roles of a user across all mutual servers",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "user_id": {
+                        "type": "string",
+                        "description": "Discord user ID"
+                    }
+                },
+                "required": ["user_id"]
+            }
+        ),
     ]
+    return tools
 
 @app.call_tool()
 @require_discord_client
@@ -347,33 +651,41 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
     elif name == "read_messages":
         channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
         limit = min(int(arguments.get("limit", 10)), 100)
-        fetch_users = arguments.get("fetch_reaction_users", False)  # Only fetch users if explicitly requested
         messages = []
         async for message in channel.history(limit=limit):
             reaction_data = []
             for reaction in message.reactions:
-                emoji_str = str(reaction.emoji.name) if hasattr(reaction.emoji, 'name') and reaction.emoji.name else str(reaction.emoji.id) if hasattr(reaction.emoji, 'id') else str(reaction.emoji)
-                reaction_info = {
-                    "emoji": emoji_str,
-                    "count": reaction.count
-                }
-                logger.error(f"Emoji: {emoji_str}")
-                reaction_data.append(reaction_info)
+                try:
+                    emoji_str = (str(reaction.emoji.name) if hasattr(reaction.emoji, 'name') and reaction.emoji.name else str(reaction.emoji.id) if hasattr(reaction.emoji, 'id') else str(reaction.emoji))
+                    reaction_data.append({"emoji": emoji_str, "count": reaction.count})
+                except AttributeError as e:
+                    logger.error(f"Error processing emoji: {e}")
+                continue
             messages.append({
                 "id": str(message.id),
                 "author": str(message.author),
                 "content": message.content,
                 "timestamp": message.created_at.isoformat(),
-                "reactions": reaction_data  # Add reactions to message dict
+                "reactions": reaction_data
             })
+
+        formatted_messages = []
+        for m in messages:
+            reaction_text = "No reactions"
+            if m['reactions']:
+                reactions = [f"{r['emoji']}({r['count']})" for r in m['reactions']]
+                reaction_text = ", ".join(reactions)
+            
+            message_text = (
+                f"{m['author']} ({m['timestamp']}):\n"
+                f"{m['content']}\n"
+                f"Reactions: {reaction_text}"
+            )
+            formatted_messages.append(message_text)
+
         return [TextContent(
             type="text",
-            text=f"Retrieved {len(messages)} messages:\n\n" + 
-                 "\n".join([
-                     f"{m['author']} ({m['timestamp']}): {m['content']}\n" +
-                     f"Reactions: {', '.join([f'{r['emoji']}({r['count']})' for r in m['reactions']]) if m['reactions'] else 'No reactions'}"
-                     for m in messages
-                 ])
+            text=f"Retrieved {len(messages)} messages:\n\n" + "\n\n".join(formatted_messages)
         )]
 
     elif name == "get_user_info":
@@ -387,11 +699,7 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
         }
         return [TextContent(
             type="text",
-            text=f"User information:\n" + 
-                 f"Name: {user_info['name']}#{user_info['discriminator']}\n" +
-                 f"ID: {user_info['id']}\n" +
-                 f"Bot: {user_info['bot']}\n" +
-                 f"Created: {user_info['created_at']}"
+            text=f"User information:\n" + f"Name: {user_info['name']}#{user_info['discriminator']}\n" + f"ID: {user_info['id']}\n" + f"Bot: {user_info['bot']}\n" + f"Created: {user_info['created_at']}"
         )]
 
     elif name == "moderate_message":
@@ -404,17 +712,23 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
         # Handle timeout if specified
         if "timeout_minutes" in arguments and arguments["timeout_minutes"] > 0:
             if isinstance(message.author, discord.Member):
-                duration = discord.utils.utcnow() + datetime.timedelta(
-                    minutes=arguments["timeout_minutes"]
-                )
-                await message.author.timeout(
-                    duration,
-                    reason=arguments["reason"]
-                )
-                return [TextContent(
+                try:
+                    duration = discord.utils.utcnow() + timedelta(
+                        minutes=arguments["timeout_minutes"]
+                    )
+                    await message.author.timeout(
+                        duration,
+                        reason=arguments["reason"]
+                    )
+                    return [TextContent(
                     type="text",
                     text=f"Message deleted and user timed out for {arguments['timeout_minutes']} minutes."
                 )]
+                except discord.Forbidden:
+                    return [TextContent(
+                        type="text",
+                        text="Message deleted but lacking permissions to timeout user."
+                    )]
         
         return [TextContent(
             type="text",
@@ -455,8 +769,7 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
         
         return [TextContent(
             type="text",
-            text=f"Server Members ({len(members)}):\n" + 
-                 "\n".join(f"{m['name']} (ID: {m['id']}, Roles: {', '.join(m['roles'])})" for m in members)
+            text=f"Server Members ({len(members)}):\n" + "\n".join(f"{m['name']} (ID: {m['id']}, Roles: {', '.join(m['roles'])})" for m in members)
         )]
 
     # Role Management Tools
@@ -511,13 +824,19 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
 
     # Message Reaction Tools
     elif name == "add_reaction":
-        channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
-        message = await channel.fetch_message(int(arguments["message_id"]))
-        await message.add_reaction(arguments["emoji"])
-        return [TextContent(
-            type="text",
-            text=f"Added reaction {arguments['emoji']} to message"
-        )]
+        try:
+            channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
+            message = await channel.fetch_message(int(arguments["message_id"]))
+            await message.add_reaction(arguments["emoji"])
+            return [TextContent(
+                type="text",
+                text=f"Added reaction {arguments['emoji']} to message"
+            )]
+        except discord.HTTPException as e:
+            return [TextContent(
+                type="text",
+                text=f"Failed to add reaction: {str(e)}"
+            )]
 
     elif name == "add_multiple_reactions":
         channel = await discord_client.fetch_channel(int(arguments["channel_id"]))
@@ -538,19 +857,169 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
             text=f"Removed reaction {arguments['emoji']} from message"
         )]
 
+    elif name == "get_user_roles":
+        user_roles = []
+        user_id = int(arguments["user_id"])
+        
+        for guild in discord_client.guilds:
+            member = guild.get_member(user_id)
+            if member:
+                roles = [
+                    {
+                        "server": guild.name,
+                        "server_id": str(guild.id),
+                        "role": role.name,
+                        "role_id": str(role.id)
+                    }
+                    for role in member.roles 
+                    if role.name != "@everyone"
+                ]
+                user_roles.extend(roles)
+        
+        return [TextContent(
+            type="text",
+            text=f"User Roles:\n" + "\n".join(
+                f"Server {r['server']}: {r['role']} (ID: {r['role_id']})" 
+                for r in user_roles
+            )
+        )]
+
     raise ValueError(f"Unknown tool: {name}")
 
+class GracefulExitEvent:
+    """Event für sauberes Beenden unter Windows"""
+    def __init__(self):
+        self._event = threading.Event()
+
+    def set(self):
+        self._event.set()
+
+    async def wait(self):
+        # Konvertiere Threading-Event in asyncio-Event
+        while not self._event.is_set():
+            await asyncio.sleep(0.1)
+        return True
+
+def win32_handler(ctrl_type):
+    """Windows Console Control Handler"""
+    if ctrl_type in (0, 2):  # CTRL_C_EVENT or CTRL_BREAK_EVENT
+        logger.info("Shutdown signal received")
+        EXIT_EVENT.set()
+        return True
+    return False
+
+# Globales Exit-Event
+EXIT_EVENT = GracefulExitEvent()
+
+async def cleanup():
+    """Cleanup function to properly close connections"""
+    if discord_client:
+        try:
+            logger.info("Starting cleanup...")
+            
+            # Disconnect from Discord
+            if not discord_client.is_closed():
+                # Stoppe zuerst den Heartbeat falls vorhanden
+                if hasattr(discord_client.ws, '_keep_alive'):
+                    try:
+                        discord_client.ws._keep_alive.stop()
+                        await asyncio.sleep(0.5)
+                    except:
+                        pass
+                
+                try:
+                    await discord_client.close()
+                    logger.info("Discord client closed")
+                except:
+                    pass
+                
+        except Exception as e:
+            logger.error(f"Error during Discord client cleanup: {e}", exc_info=True)
+
+def handle_exit():
+    """Handle synchronous cleanup on process termination"""
+    logger.info("Process termination detected, running cleanup...")
+    if discord_client and not discord_client.is_closed():
+        try:
+            if hasattr(discord_client.ws, '_keep_alive'):
+                discord_client.ws._keep_alive.stop()
+            loop = asyncio.new_event_loop()
+            loop.run_until_complete(discord_client.close())
+            loop.close()
+        except:
+            pass
+    logger.info("Emergency cleanup complete")
+
 async def main():
-    # Start Discord bot in the background
-    asyncio.create_task(bot.start(DISCORD_TOKEN))
+    """Main entry point with proper cleanup"""
+    if not DISCORD_TOKEN:
+        logger.error("DISCORD_TOKEN environment variable is not set")
+        return 1
     
-    # Run MCP server
-    async with stdio_server() as (read_stream, write_stream):
-        await app.run(
-            read_stream,
-            write_stream,
-            app.create_initialization_options()
-        )
+    # Registriere Windows Event Handler
+    if sys.platform == 'win32':
+        kernel32 = ctypes.windll.kernel32
+        kernel32.SetConsoleCtrlHandler(ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_ulong)(win32_handler), True)
+    
+    # Registriere Notfall-Cleanup
+    atexit.register(handle_exit)
+    
+    try:
+        # Start Discord bot
+        bot_task = asyncio.create_task(bot.start(DISCORD_TOKEN))
+        logger.info("Starting Discord bot...")
+        
+        # Wait for bot to be ready
+        timeout = 30
+        start_time = asyncio.get_event_loop().time()
+        while not discord_client:
+            if asyncio.get_event_loop().time() - start_time > timeout:
+                raise TimeoutError("Discord bot failed to start within timeout period")
+            await asyncio.sleep(0.1)
+        
+        logger.info("Bot is ready, starting MCP server...")
+        
+        try:    
+            # Run MCP server
+            async with stdio_server() as (read_stream, write_stream):
+                server_task = asyncio.create_task(
+                    app.run(
+                        read_stream,
+                        write_stream,
+                        app.create_initialization_options()
+                    )
+                )
+                
+                # Warte auf Server-Task oder Exit-Event
+                await asyncio.wait(
+                    [server_task, EXIT_EVENT.wait()],
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+                
+                logger.info("Starting shutdown sequence...")
+                
+        except Exception as e:
+            logger.error(f"Error in server task: {e}", exc_info=True)
+        finally:
+            # Cleanup
+            await cleanup()
+            
+            # Cancel remaining tasks
+            for task in asyncio.all_tasks():
+                if task is not asyncio.current_task():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                    
+    except Exception as e:
+        logger.error(f"Error in main loop: {e}", exc_info=True)
+        return 1
+    finally:
+        logger.info("Shutdown complete")
+        
+    return 0
 
 if __name__ == "__main__":
     asyncio.run(main())
