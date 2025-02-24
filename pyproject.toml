@@ -3,7 +3,7 @@ name = "mcp-discord"
 version = "0.1.0"
 description = "Discord integration for Model Context Protocol"
 authors = [
-    {name = "Hanweg Altimer", email = "hanwegaltimer@outlook.com"},
+    {name = "CeeJay79", email = "ceejay79@live.de"},
 ]
 dependencies = [
     "discord.py>=2.3.0",
